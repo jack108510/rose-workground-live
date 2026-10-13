@@ -1,0 +1,237 @@
+(() => {
+  'use strict';
+  const API = 'https://wildrose-widget.wildeautomations.com';
+  const SNAPSHOT_KEY = 'roseContextWebSnapshot';
+  const $ = id => document.getElementById(id);
+  const groups = [
+    { id: 'business', name: 'Business', words: /business name|description|about|company|established|specializ/i },
+    { id: 'services', name: 'Services', words: /service|repair|install|offer|product|quote|price|cost|sell/i },
+    { id: 'hours', name: 'Hours', words: /hour|monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekday|open|closed|am\b|pm\b/i },
+    { id: 'areas', name: 'Locations', words: /area|location|address|serve|serving|region|city|town|province|street|\broad\b/i },
+    { id: 'contact', name: 'Contact', words: /contact|email|phone|call|@|\+\d|\b\d{3}[- .]\d{3}/i },
+    { id: 'other', name: 'Other facts', words: /.*/ },
+  ];
+  let account = {}, approved = [], pending = [], selected = null, filter = 'all', query = '';
+  let lastSiteScan = null, currentSession = '', loading = false, explicitSelection = false;
+  const web = new window.ContextMap(node => {
+    explicitSelection = true;
+    filter = 'all'; query = ''; $('search').value = '';
+    document.querySelectorAll('[data-filter]').forEach(button => { const active = button.dataset.filter === 'all'; button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active)); });
+    const match = node.fact || facts().find(fact => node.kind === 'category' ? fact.group === node.group : node.kind === 'source' ? fact.sourceUrl === node.url : true);
+    selected = match?.id || null;
+    renderList();
+    if (matchMedia('(max-width:700px)').matches) $('detail').scrollIntoView({behavior:matchMedia('(prefers-reduced-motion:reduce)').matches?'instant':'smooth',block:'start'});
+  });
+  const token = () => localStorage.getItem('wildroseDashboardToken') || localStorage.getItem('roseDashboardToken') || '';
+  const clean = (value, max = 2400) => String(value || '').slice(0, max);
+  function safeUrl(value) {
+    try { const url = new URL(value); return /^https?:$/.test(url.protocol) && !url.username && !url.password ? url.href : ''; }
+    catch { return ''; }
+  }
+  const sourceLabel = value => {
+    try { const url = new URL(value); return url.hostname.replace(/^www\./, '') + (url.pathname === '/' ? '' : url.pathname); }
+    catch { return 'Source not recorded'; }
+  };
+  async function sessionId(value) {
+    if (!value) return '';
+    const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+    return Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+  function normalise(note, status) {
+    const text = clean(note.text || note.content);
+    const label = clean(note.label, 120);
+    const category = (/service areas/i.test(label) ? groups.find(group => group.id === 'areas') : null) || groups.find(group => group.id !== 'other' && group.words.test(label + ' ' + text)) || groups[groups.length - 1];
+    return { id: status + ':' + clean(note.id || text, 140), originalId: clean(note.id, 140), text, label,
+      status, group: category.id, sourceUrl: safeUrl(note.sourceUrl), source: clean(note.source, 80),
+      scanId: clean(note.scanId, 120), createdAt: clean(note.reviewedAt || note.createdAt, 60) };
+  }
+  const facts = () => [...pending, ...approved];
+  const visible = fact => (filter === 'all' || fact.status === filter) &&
+    (!query || (fact.text + ' ' + fact.label + ' ' + sourceLabel(fact.sourceUrl)).toLowerCase().includes(query));
+  function element(tag, className, text) {
+    const el = document.createElement(tag); if (className) el.className = className; if (text) el.textContent = text; return el;
+  }
+  function notify(message) { $('notice').textContent = message; $('notice').hidden = !message; }
+  function clearSession() {
+    localStorage.removeItem('wildroseDashboardToken');
+    localStorage.removeItem('roseDashboardToken');
+    ['roseClientSettings','roseCommandHistory','roseSavedContext','rosePreviewKnowledge','rosePreviewApiKeys','roseDraftConnections','roseConnectedConnections','roseDraftWorkflows','rosePendingWorkflowDrafts','roseDraftConfig','rosePendingContextReview','roseLastSiteScan',SNAPSHOT_KEY].forEach(key=>localStorage.removeItem(key));
+    currentSession = ''; lastSiteScan = null; account = {}; approved = []; pending = []; selected = null;
+    render();
+  }
+  async function request(path, body) {
+    const requestToken = token();
+    const response = await fetch(API + path, { method: body ? 'POST' : 'GET',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + requestToken },
+      ...(body ? { body: JSON.stringify(body) } : {}) });
+    const data = await response.json().catch(() => ({}));
+    if (token() !== requestToken) throw new Error('Your account changed. Refresh to sync the current account.');
+    if (!response.ok || data.ok === false) {
+      const error = new Error(data.error || 'Could not sync your context. Please try again.');
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  }
+  function errorMessage(error) {
+    if (error.status === 401 || error.status === 403) {
+      clearSession(); notify('Your session expired. Sign in to Workground to continue.');
+    } else notify(error.message || 'Could not sync your context. Please try again.');
+  }
+  function readSnapshot(session) {
+    try {
+      const snapshot = JSON.parse(localStorage.getItem(SNAPSHOT_KEY) || 'null');
+      return snapshot?.session === session && Array.isArray(snapshot.pending) ? snapshot : null;
+    } catch { return null; }
+  }
+  function saveSnapshot() {
+    localStorage.setItem(SNAPSHOT_KEY, JSON.stringify({ version: 1, session: currentSession,
+      lastSiteScan, website: $('websiteInput').value, businessName: account.businessName || '',
+      pending: pending.map(fact => ({ id: fact.originalId, text: fact.text, label: fact.label,
+        sourceUrl: fact.sourceUrl, source: fact.source, scanId: fact.scanId, createdAt: fact.createdAt })),
+      updatedAt: new Date().toISOString() }));
+  }
+  async function loadContext() {
+    if (loading) return;
+    if (!token()) { currentSession = ''; account = {}; approved = []; pending = []; selected = null; render(); return; }
+    loading = true; $('refresh').disabled = true; $('syncLabel').textContent = 'Syncing…';
+    try {
+      const loadingToken = token(); const session = await sessionId(loadingToken);
+      const [dashboard, knowledge] = await Promise.all([
+        request('/api/rose-account-dashboard'), request('/api/rose-account-knowledge'),
+      ]);
+      if (token() !== loadingToken) return;
+      account = { businessName: clean(dashboard.customer?.businessName, 180),
+        website: safeUrl(dashboard.draft?.settings?.website || dashboard.customer?.website),
+        email: clean(dashboard.account?.email, 240) };
+      approved = (Array.isArray(knowledge.notes) ? knowledge.notes : []).filter(note => note && !note.revokedAt && (note.text || note.content)).map(note => normalise(note, 'approved'));
+      currentSession = session;
+      const snapshot = readSnapshot(session); lastSiteScan = snapshot?.lastSiteScan || null;
+      pending = (snapshot?.pending || []).filter(note => note?.text).map(note => normalise(note, 'pending'));
+      pending = pending.filter(fact => !approved.some(saved => saved.text === fact.text && saved.sourceUrl === fact.sourceUrl));
+      $('websiteInput').value = safeUrl(snapshot?.website) || account.website;
+      notify(''); render();
+    } catch (error) { errorMessage(error); $('syncLabel').textContent = 'Sync unavailable'; }
+    finally { loading = false; $('refresh').disabled = false; }
+  }
+  function sourceInfo(container, url, source, label = '') {
+    const box = element('div', 'source-info');
+    box.appendChild(element('span', '', url ? 'Source page' : source === 'owner-chat' ? 'Suggested from your Builder conversation' : source === 'document' ? 'Uploaded document: ' + (label || 'document') : source === 'owner' ? 'Added by the business owner' : 'Source not recorded'));
+    if (url) { const anchor = element('a', '', sourceLabel(url)); anchor.href = url; anchor.target = '_blank'; anchor.rel = 'noopener noreferrer'; box.appendChild(anchor); }
+    container.appendChild(box);
+  }
+  function showFact(fact) {
+    const detail = $('detail'); detail.replaceChildren();
+    detail.appendChild(element('span', 'tag ' + fact.status, fact.status === 'approved' ? '✓ Approved knowledge' : '○ Needs your review'));
+    detail.appendChild(element('h2', '', fact.label || groups.find(group => group.id === fact.group).name));
+    let editor;
+    if (fact.status === 'pending') {
+      editor = element('textarea'); editor.value = fact.text; editor.setAttribute('aria-label', 'Edit context fact before approval'); detail.appendChild(editor);
+    } else detail.appendChild(element('p', 'fact-text', fact.text));
+    sourceInfo(detail, fact.sourceUrl, fact.source, fact.label);
+    if (fact.status === 'pending') {
+      detail.appendChild(element('p', 'detail-placeholder', 'This suggestion is not published. Check it before approving.'));
+      const actions = element('div', 'detail-actions');
+      const approve = element('button', 'primary', 'Approve fact'); approve.type = 'button';
+      const discard = element('button', 'secondary', 'Discard'); discard.type = 'button';
+      actions.append(approve, discard); detail.appendChild(actions);
+      approve.addEventListener('click', async () => {
+        const text = editor.value.trim();
+        if (text.length < 3) { notify('Add a little more detail before approving this fact.'); return; }
+        approve.disabled = discard.disabled = true; approve.textContent = 'Saving…';
+        try {
+          const data = await request('/api/rose-account-knowledge', { action: 'add', text, source: fact.source === 'document' ? 'document' : fact.source === 'owner-chat' ? 'owner-chat' : 'website-scan', sourceUrl: fact.sourceUrl, scanId: fact.scanId });
+          if (!data.note?.id) throw new Error('The approved fact could not be saved. Please try again.');
+          approved.push(normalise(data.note, 'approved')); pending = pending.filter(item => item.id !== fact.id);
+          selected = 'approved:' + data.note.id; saveSnapshot(); notify('Fact approved. Publish from Builder when your context is ready.'); render();
+        } catch (error) { errorMessage(error); approve.disabled = discard.disabled = false; approve.textContent = 'Approve fact'; }
+      });
+      discard.addEventListener('click', () => { pending = pending.filter(item => item.id !== fact.id); selected = null; saveSnapshot(); notify('Suggestion discarded.'); render(); });
+    }
+  }
+  function renderList() {
+    const rows = facts().filter(visible);
+    if (!rows.some(fact => fact.id === selected)) selected = rows[0]?.id || null;
+    const current = rows.find(fact => fact.id === selected);
+    web.select(explicitSelection ? selected : null);
+    if (current) showFact(current);
+    else $('detail').replaceChildren(element('p', 'detail-placeholder', facts().length ? 'No facts match this view.' : 'Scan a website or tell Builder about your business to add knowledge.'));
+    $('listCount').textContent = rows.length + (rows.length === 1 ? ' fact' : ' facts');
+    const list = $('facts'); list.replaceChildren();
+    if (!rows.length) {
+      list.appendChild(element('p', 'no-results', facts().length ? 'No facts match this view. Try another filter or search.' : 'No knowledge yet. Scan your website above, or tell Builder about your business.'));
+      if (!facts().length) { const builder = element('a', 'empty-action', 'Open Builder →'); builder.href = './'; list.appendChild(builder); }
+      return;
+    }
+    rows.forEach(fact => {
+      const row = element('button', 'fact-row ' + fact.status + (selected === fact.id ? ' selected' : '')); row.type = 'button';
+      const dot = element('i'); dot.setAttribute('aria-hidden', 'true');
+      const copy = element('div'); copy.appendChild(element('b', '', fact.text));
+      copy.appendChild(element('small', '', groups.find(group => group.id === fact.group).name + ' · ' + (fact.status === 'approved' ? 'Approved' : 'Needs review')));
+      row.append(dot, copy); row.addEventListener('click', () => {
+        explicitSelection = true; selected = fact.id; renderList();
+        if (matchMedia('(max-width:700px)').matches) $('detail').scrollIntoView({behavior:matchMedia('(prefers-reduced-motion:reduce)').matches?'instant':'smooth',block:'start'});
+      }); list.appendChild(row);
+    });
+  }
+  function render() {
+    const signedIn = !!token();
+    $('accountButton').textContent = signedIn ? 'Sign out' : 'Sign in';
+    $('businessLabel').textContent = account.businessName || 'Your business';
+    $('syncLabel').textContent = signedIn && currentSession ? 'Account synced' : 'Sign in to connect';
+    $('approvedCount').textContent = approved.length; $('pendingCount').textContent = pending.length;
+    $('sourceCount').textContent = new Set(facts().map(fact => fact.sourceUrl).filter(Boolean)).size;
+    web.update(facts(), groups, account.businessName);
+    renderList();
+  }
+  function scanCandidates(scraped, scanId, website) {
+    const rows = []; const detected = scraped.detected || {};
+    const add = (label, value) => {
+      for (const item of (Array.isArray(value) ? value : [value])) {
+        const text = clean(item).trim();
+        if (text.length > 2) rows.push(normalise({ id: scanId + '_' + rows.length, label, text,
+          source: 'website-scan', sourceUrl: website, scanId }, 'pending'));
+      }
+    };
+    add('Business name', scraped.businessName); add('Description', scraped.description);
+    add('Services', detected.services || scraped.services); add('Service areas', scraped.areasServed || detected.areasServed);
+    add('Hours', scraped.hours || detected.hours); add('Contact', scraped.contactEmail || detected.contactEmail);
+    return rows;
+  }
+  $('scanForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!token()) { location.href = './?returnTo=context'; return; }
+    const website = safeUrl($('websiteInput').value.trim());
+    if (!website) { notify('Enter a valid website URL starting with https:// or http://.'); return; }
+    const button = $('scanButton'); button.disabled = true; button.textContent = 'Scanning…';
+    try {
+      if (!currentSession) await loadContext();
+      if (!currentSession) return;
+      const data = await request('/api/rose-site-scan', { website, sourcePage: location.href });
+      if (!data.scraped) throw new Error('No website facts were returned. Try again or add knowledge in Builder.');
+      const rows = scanCandidates(data.scraped, clean(data.scanId || Date.now(), 120), website);
+      const known = new Set([...approved, ...pending].map(fact => fact.text.trim().toLowerCase() + '|' + fact.sourceUrl));
+      const fresh = rows.filter(fact => { const key = fact.text.trim().toLowerCase() + '|' + fact.sourceUrl; if (known.has(key)) return false; known.add(key); return true; });
+      pending.push(...fresh);
+      lastSiteScan = {website, quality:Number(data.scraped.scanQuality||0),pages:Number(data.scraped.pagesScanned||0),missing:data.scraped.missingQuestions||data.scraped.detected?.missingQuestions||[]};
+      $('websiteInput').value = website; saveSnapshot(); selected = null; $('scanPanel').open = false;
+      notify(fresh.length ? fresh.length + ' new website suggestions are ready for your review.' : 'No new facts found. You can add details in Builder.');
+      render();
+    } catch (error) { errorMessage(error); }
+    finally { button.disabled = false; button.textContent = 'Scan website'; }
+  });
+  $('accountButton').addEventListener('click', () => {
+    if (!token()) location.href = './?returnTo=context';
+    else { clearSession(); notify('Signed out.'); }
+  });
+  $('refresh').addEventListener('click', loadContext);
+  $('search').addEventListener('input', () => { query = $('search').value.trim().toLowerCase(); selected = null; renderList(); });
+  document.querySelectorAll('[data-filter]').forEach(button => button.addEventListener('click', () => {
+    filter = button.dataset.filter; selected = null;
+    document.querySelectorAll('[data-filter]').forEach(item => { item.classList.toggle('active', item === button); item.setAttribute('aria-pressed', String(item === button)); });
+    renderList();
+  }));
+  window.addEventListener('focus', loadContext);
+  window.addEventListener('storage', event => { if ([SNAPSHOT_KEY, 'wildroseDashboardToken', 'roseDashboardToken'].includes(event.key)) loadContext(); });
+  render(); loadContext();
+})();
