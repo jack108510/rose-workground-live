@@ -35,6 +35,7 @@ jobs:
           mkdir -p dist/logos
           cp index.html dist/index.html
           cp .nojekyll dist/.nojekyll
+          cp CNAME dist/CNAME
           cp source/login.html source/auth-reference.css dist/
           cp source/logos/wildrose.png dist/logos/wildrose.png
           cp -R source/workground dist/workground
