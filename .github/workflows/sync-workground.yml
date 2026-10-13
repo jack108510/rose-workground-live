@@ -1,0 +1,49 @@
+name: Sync Rose Workground
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: rose-workground-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out live site
+        uses: actions/checkout@v4
+      - name: Check out current Workground
+        uses: actions/checkout@v4
+        with:
+          repository: jack108510/rose-dashboard-preview
+          ref: main
+          path: source
+          persist-credentials: false
+      - name: Assemble site
+        run: |
+          mkdir -p dist/logos
+          cp index.html dist/index.html
+          cp .nojekyll dist/.nojekyll
+          cp source/login.html source/auth-reference.css dist/
+          cp source/logos/wildrose.png dist/logos/wildrose.png
+          cp -R source/workground dist/workground
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Upload site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - name: Deploy site
+        id: deployment
+        uses: actions/deploy-pages@v4
